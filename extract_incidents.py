@@ -36,6 +36,74 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return full_text
 
 
+def extract_source_urls(pdf_path: str) -> dict[int, list[str]]:
+    """Extract source URLs from PDF hyperlink annotations.
+
+    The "(Source)" text in the PDF is typically a clickable hyperlink whose URL
+    is stored as a PDF annotation, not in the plain text.  This function
+    correlates each "(Source)" text occurrence (by its spatial position on the
+    page) with the nearest hyperlink annotation and returns a mapping from
+    character offset (in the concatenated extracted text) to a list of URLs.
+
+    Returns a dict mapping ``char_offset`` → ``[url, ...]`` where
+    *char_offset* is the position of the ``(Source)`` regex match in the
+    full extracted text string.
+    """
+    source_url_map: dict[int, list[str]] = {}
+
+    with pdfplumber.open(pdf_path) as pdf:
+        char_offset = 0
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+
+            links = page.hyperlinks
+            if not links:
+                char_offset += len(text) + 1  # +1 for the "\n" appended per page
+                continue
+
+            # Spatial "(Source)" locations on this page, sorted top-to-bottom
+            source_locs = sorted(
+                page.search(r"Source", regex=True), key=lambda s: s["top"]
+            )
+
+            # Hyperlinks sorted top-to-bottom
+            sorted_links = sorted(links, key=lambda lnk: lnk["top"])
+
+            # Greedily match each spatial Source location to its nearest
+            # hyperlink (within a 5-unit tolerance).
+            used_link_idxs: set[int] = set()
+            source_to_url: dict[int, str] = {}  # source_loc_index → url
+            for si, src in enumerate(source_locs):
+                best_idx: int | None = None
+                best_dist = float("inf")
+                for li, link in enumerate(sorted_links):
+                    if li in used_link_idxs:
+                        continue
+                    dist = abs(link["top"] - src["top"])
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = li
+                if best_idx is not None and best_dist < 5.0:
+                    used_link_idxs.add(best_idx)
+                    source_to_url[si] = sorted_links[best_idx]["uri"]
+
+            # Sequential "(Source)" regex matches in the page text — pair them
+            # by order with the spatial results (both are top-to-bottom).
+            text_matches = list(SOURCE_MARKER_RE.finditer(text))
+            for ti, tm in enumerate(text_matches):
+                if ti in source_to_url:
+                    abs_offset = char_offset + tm.start()
+                    source_url_map.setdefault(abs_offset, []).append(
+                        source_to_url[ti]
+                    )
+
+            char_offset += len(text) + 1
+
+    return source_url_map
+
+
 # ---------------------------------------------------------------------------
 # 2.  INCIDENT PARSING
 # ---------------------------------------------------------------------------
@@ -127,7 +195,7 @@ def clean_title(title: str) -> str:
     return title.strip()
 
 
-def find_incidents(text: str) -> list[dict]:
+def find_incidents(text: str, source_url_map: dict[int, list[str]] | None = None) -> list[dict]:
     """
     Parse the extracted text and return a list of incidents.
 
@@ -137,7 +205,10 @@ def find_incidents(text: str) -> list[dict]:
         date        – date string from the title
         category    – section category (e.g. "BANKING / FINANCIAL INSTITUTIONS")
         full_text   – raw text of the entire incident block
+        source_urls – list of source article URLs (may be empty)
     """
+    if source_url_map is None:
+        source_url_map = {}
 
     # -- Preprocessing: find end-of-incidents boundary -----------------------
     end_boundary = find_end_boundary(text)
@@ -147,13 +218,18 @@ def find_incidents(text: str) -> list[dict]:
     for m in SOURCE_MARKER_RE.finditer(text, 0, end_boundary):
         raw_source_list.append([m.start(), m.end()])
 
-    # Deduplicate consecutive Source markers within ~20 chars of each other
-    source_positions = []
+    # Deduplicate consecutive Source markers within ~20 chars of each other.
+    # Track which raw offsets belong to each merged group so we can collect
+    # all associated URLs later.
+    source_positions = []       # [[start, end], ...]
+    source_raw_offsets = []     # [set_of_raw_starts, ...] parallel to source_positions
     for sp in raw_source_list:
         if source_positions and sp[0] - source_positions[-1][1] < 20:
             source_positions[-1][1] = sp[1]  # extend end of last entry
+            source_raw_offsets[-1].add(sp[0])
         else:
             source_positions.append(sp)
+            source_raw_offsets.append({sp[0]})
 
     source_starts = [sp[0] for sp in source_positions]
 
@@ -247,11 +323,13 @@ def find_incidents(text: str) -> list[dict]:
     for tl in title_locations:
         # Find the first unused (Source) that comes after this title
         matched = None
-        for sp in source_positions:
+        matched_idx = None
+        for si, sp in enumerate(source_positions):
             sp_start = sp[0]
             sp_end = sp[1]
             if sp_start > tl["title_end"] and sp_start not in used_sources:
                 matched = (sp_start, sp_end)
+                matched_idx = si
                 used_sources.add(sp_start)
                 break
 
@@ -270,12 +348,18 @@ def find_incidents(text: str) -> list[dict]:
         body = text[tl["title_end"]:matched[0]].strip()
         full = text[tl["title_start"]:matched[1]].strip()
 
+        # Collect source URLs from all raw (Source) markers in this group
+        urls: list[str] = []
+        for raw_offset in sorted(source_raw_offsets[matched_idx]):
+            urls.extend(source_url_map.get(raw_offset, []))
+
         incidents.append({
             "title": cleaned_title,
             "body": body,
             "date": tl["date"],
             "category": category,
             "full_text": full,
+            "source_urls": urls,
         })
 
     # -- Step 4: Filter out non-incident matches -----------------------------
@@ -313,6 +397,7 @@ def write_incident_markdown(incident: dict, output_dir: str, index: int) -> str:
     body = incident["body"]
     date = incident["date"]
     category = incident.get("category", "")
+    source_urls = incident.get("source_urls", [])
 
     slug = sanitize_filename(title)
     filename = f"{index:03d}_{slug}.md"
@@ -331,6 +416,14 @@ def write_incident_markdown(incident: dict, output_dir: str, index: int) -> str:
             cleaned = " ".join(para.split())
             if cleaned:
                 f.write(f"{cleaned}\n\n")
+
+        # Sources section
+        if source_urls:
+            f.write("---\n\n")
+            f.write("## Sources\n\n")
+            for url in source_urls:
+                f.write(f"- <{url}>\n")
+            f.write("\n")
 
     return filepath
 
@@ -370,7 +463,11 @@ def main():
     text = extract_text_from_pdf(pdf_path)
     print(f"Extracted {len(text):,} characters of text.\n")
 
-    incidents = find_incidents(text)
+    print("Extracting source URLs from PDF hyperlinks...")
+    source_url_map = extract_source_urls(pdf_path)
+    print(f"Found {len(source_url_map)} source hyperlinks.\n")
+
+    incidents = find_incidents(text, source_url_map)
     print(f"Found {len(incidents)} incidents.\n")
 
     if not incidents:
