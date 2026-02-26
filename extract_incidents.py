@@ -13,6 +13,7 @@ Usage:
 If no output directory is specified, files are written to ./extracted_incidents/
 """
 
+import bisect
 import re
 import os
 import sys
@@ -39,31 +40,90 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 # 2.  INCIDENT PARSING
 # ---------------------------------------------------------------------------
 
-# The date suffix pattern at the end of incident titles
+# Full date suffix: handles hyphens, en-dashes, em-dashes; optional comma after month name
 DATE_SUFFIX = re.compile(
-    r"-\s+"
+    r"[-–—]\s+"
     r"((?:January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"\s+\d{1,2}[,.]?\s*\d{4})"
+    r",?\s+\d{1,2}[,.]?\s*\d{4})"
 )
 
-# The "(Source)" marker that ends every incident
-SOURCE_MARKER = "(Source)"
+# Year-only date patterns: "- 2010", "– 2010", "— 2010" (end of line), or "(2005)"
+DATE_SUFFIX_YEAR_ONLY = re.compile(
+    r"[-–—]\s+((?:19|20)\d{2})\s*$"
+    r"|"
+    r"\(((?:19|20)\d{2})\)",
+    re.MULTILINE,
+)
+
+# "(Source)" marker — allow spaces inside parens, case-insensitive
+SOURCE_MARKER_RE = re.compile(r"\(\s*Source\s*\)", re.IGNORECASE)
+
+# ALL-CAPS section header lines (e.g. "BANKING / FINANCIAL INSTITUTIONS")
+# Includes Unicode curly apostrophe \u2019 and en/em-dashes for PDFs with smart quotes.
+SECTION_HEADER_RE = re.compile(r"^([A-Z][A-Z0-9 /\(\)\-&.,'\u2019\u2013\u2014]+)$", re.MULTILINE)
+
+# Keywords that real incident titles contain
+TITLE_KEYWORDS = re.compile(
+    r"(?:embezzl|fraud|stol|steal|sentenced|guilty|charged|theft|"
+    r"kickback|scheme|conspir|misappropriat|indicted|arrested|"
+    r"pleads?|convicted|stealing|pocketing|accused|admits?|"
+    r"fired|spent|murder|robbery|negligent|awarded|"
+    r"brib|extort|launder|wire\s+fraud|bank\s+fraud|mail\s+fraud|"
+    r"defraud|misus|divert|corrup|hack|leak|espionage|sabotage|"
+    r"threaten|harass|assault|manslaughter)",
+    re.IGNORECASE,
+)
+
+
+def find_section_headers(text: str) -> list[tuple[int, str]]:
+    """Return sorted list of (position, header_text) for ALL-CAPS section headers."""
+    headers = []
+    for m in SECTION_HEADER_RE.finditer(text):
+        header = m.group(1).strip()
+        if len(header) >= 5:
+            headers.append((m.start(), header))
+    return headers
+
+
+def find_end_boundary(text: str) -> int:
+    """
+    Find the position where real incident content ends.
+    Everything after this point (e-magazine promos, source-listings) is excluded.
+    These markers appear immediately after the last real (Source) in every test file.
+    """
+    end_boundary = len(text)
+    for marker in [
+        "WORKPLACE VIOLENCE (WPV) INSIDER THREAT INCIDENTS E-MAGAZINE",
+        "SOURCES FOR INSIDER THREAT INCIDENT POSTINGS",
+    ]:
+        pos = text.find(marker)
+        if pos != -1:
+            end_boundary = min(end_boundary, pos)
+    return end_boundary
 
 
 def clean_title(title: str) -> str:
-    """Remove page numbers, stray digits, and other artifacts from titles."""
-    # Remove leading page numbers like "5\n", "12\n", "5 \n", etc.
+    """Remove page numbers, section headers, and other artifacts from titles."""
+    # Remove leading page numbers like "5\n", "12\n"
     title = re.sub(r"^\d{1,3}\s*\n", "", title)
     # Remove trailing page numbers
     title = re.sub(r"\n\d{1,3}\s*$", "", title)
-    # Remove standalone page numbers that appear mid-title from page breaks
+    # Remove standalone page numbers mid-title from page breaks
     title = re.sub(r"\n\d{1,3}\n", "\n", title)
+    # Strip leading ALL-CAPS section header lines that bled in (newline-separated)
+    _hdr_line = re.compile(r"^[A-Z][A-Z0-9 /\(\)\-&.,'\u2019\u2013\u2014]{4,}$")
+    lines = title.splitlines()
+    while lines and _hdr_line.match(lines[0].strip()):
+        lines.pop(0)
+    title = "\n".join(lines)
     # Collapse internal newlines into spaces (titles can wrap)
     title = re.sub(r"\s*\n\s*", " ", title)
+    # Strip inline leading ALL-CAPS section header prefix (same-line bleed-in)
+    title = re.sub(
+        r"^[A-Z][A-Z0-9 /\(\)\-&.,'\u2019\u2013\u2014]{4,}\s+(?=[A-Z])", "", title
+    )
     # Collapse multiple spaces
     title = re.sub(r" {2,}", " ", title)
-    # Remove section header prefixes that might have bled in
-    title = re.sub(r"^EMPLOYEE PERSONAL ENRICHMENT INCIDENTS\s*", "", title)
     return title.strip()
 
 
@@ -75,76 +135,121 @@ def find_incidents(text: str) -> list[dict]:
         title       – cleaned incident headline
         body        – the descriptive paragraphs (between title and Source)
         date        – date string from the title
+        category    – section category (e.g. "BANKING / FINANCIAL INSTITUTIONS")
         full_text   – raw text of the entire incident block
     """
 
-    # -- Step 1: Find all title-date positions --------------------------------
-    title_locations = []
-    for m in DATE_SUFFIX.finditer(text):
-        date_str = m.group(1).strip()
-        date_end_pos = m.end()
+    # -- Preprocessing: find end-of-incidents boundary -----------------------
+    end_boundary = find_end_boundary(text)
 
-        # Walk backwards to find where this title block starts.
-        # Titles begin after a blank line, after a prior "(Source)", 
-        # or after a known section header.
-        search_from = m.start()
-        prev_source = text.rfind(SOURCE_MARKER, 0, search_from)
+    # -- Step A: Find all (Source) positions (within incident section only) --
+    raw_source_list = []
+    for m in SOURCE_MARKER_RE.finditer(text, 0, end_boundary):
+        raw_source_list.append([m.start(), m.end()])
+
+    # Deduplicate consecutive Source markers within ~20 chars of each other
+    source_positions = []
+    for sp in raw_source_list:
+        if source_positions and sp[0] - source_positions[-1][1] < 20:
+            source_positions[-1][1] = sp[1]  # extend end of last entry
+        else:
+            source_positions.append(sp)
+
+    source_starts = [sp[0] for sp in source_positions]
+
+    # -- Step B: Build a title-location finder using the source list ---------
+    def build_title_location(m_start: int, m_end: int, date_str: str) -> dict:
+        """Walk backward from a date match to determine where the title starts."""
+        search_from = m_start
+
+        # Rightmost Source marker before this date match (binary search)
+        idx = bisect.bisect_left(source_starts, search_from) - 1
+        if idx >= 0:
+            prev_source, prev_source_end = source_positions[idx]
+        else:
+            prev_source, prev_source_end = -1, -1
+
         prev_blank = text.rfind("\n\n", 0, search_from)
-        
-        # Also look for known section headers that precede incidents
-        section_headers = [
-            "EMPLOYEE PERSONAL ENRICHMENT INCIDENTS",
-            "Examples Of Where Implementing ECMR",
-        ]
-        prev_header = -1
-        for hdr in section_headers:
-            pos = text.rfind(hdr, 0, search_from)
-            if pos != -1:
-                # Position after the header line
-                end_of_header = text.find("\n", pos)
-                if end_of_header != -1 and end_of_header > prev_header:
-                    prev_header = end_of_header + 1
 
-        boundary = max(prev_source, prev_blank, prev_header)
-        if boundary == -1:
+        if max(prev_source, prev_blank) == -1:
             title_start = 0
-        elif prev_header >= prev_source and prev_header >= prev_blank:
-            title_start = prev_header
         elif prev_source > prev_blank:
-            title_start = prev_source + len(SOURCE_MARKER)
+            title_start = prev_source_end
         else:
             title_start = prev_blank + 2
 
-        # Skip whitespace
+        # Skip leading whitespace
         while title_start < search_from and text[title_start] in (" ", "\n", "\t", "\r"):
             title_start += 1
 
-        raw_title = text[title_start:date_end_pos]
-        title_locations.append({
+        # Forward-scan: if there are intermediate blank lines or ALL-CAPS section
+        # headers between title_start and the date match, advance past the last one.
+        # This handles empty sections ("No Incidents To Report") that precede the
+        # real incident title in the same document span.
+        last_sep = title_start
+        scan_pos = title_start
+        while True:
+            bp = text.find("\n\n", scan_pos, search_from)
+            if bp == -1:
+                break
+            last_sep = bp + 2
+            scan_pos = bp + 1
+        for m2 in SECTION_HEADER_RE.finditer(text, title_start, search_from):
+            line_end = text.find("\n", m2.end())
+            candidate = (line_end + 1) if (0 <= line_end < search_from) else m2.end()
+            if candidate > last_sep:
+                last_sep = candidate
+        if last_sep > title_start:
+            title_start = last_sep
+            while title_start < search_from and text[title_start] in (" ", "\n", "\t", "\r"):
+                title_start += 1
+
+        return {
             "title_start": title_start,
-            "title_end": date_end_pos,
-            "raw_title": raw_title,
+            "title_end": m_end,
+            "raw_title": text[title_start:m_end],
             "date": date_str,
-        })
+        }
 
-    # -- Step 2: Find all (Source) end positions ------------------------------
-    source_positions = []
-    idx = 0
-    while True:
-        pos = text.find(SOURCE_MARKER, idx)
-        if pos == -1:
-            break
-        source_positions.append((pos, pos + len(SOURCE_MARKER)))
-        idx = pos + 1
+    # -- Step 1: Find all title-date positions --------------------------------
 
-    # -- Step 3: Pair each title with its next (Source) -----------------------
+    title_locations = []
+    full_date_spans = []  # (match_start, match_end) for each full-date match
+
+    # 1a: Full month-name dates
+    for m in DATE_SUFFIX.finditer(text, 0, end_boundary):
+        date_str = " ".join(m.group(1).split())  # normalize internal whitespace/newlines
+        loc = build_title_location(m.start(), m.end(), date_str)
+        title_locations.append(loc)
+        full_date_spans.append((m.start(), m.end()))
+
+    # 1b: Year-only dates — skip if the match overlaps a full-date span
+    for m in DATE_SUFFIX_YEAR_ONLY.finditer(text, 0, end_boundary):
+        if any(fs <= m.start() <= fe for fs, fe in full_date_spans):
+            continue
+        date_str = (m.group(1) or m.group(2)).strip()
+        loc = build_title_location(m.start(), m.end(), date_str)
+        # Pre-filter: only keep if the inferred title contains crime keywords
+        if not TITLE_KEYWORDS.search(loc["raw_title"]):
+            continue
+        title_locations.append(loc)
+
+    # Sort by position in document
+    title_locations.sort(key=lambda x: x["title_start"])
+
+    # -- Step 2: Build section header list for category tracking -------------
+    section_headers = find_section_headers(text)
+
+    # -- Step 3: Pair each title with its next (Source) ----------------------
     incidents = []
     used_sources = set()
 
     for tl in title_locations:
-        # Find the first unused (Source) after this title
+        # Find the first unused (Source) that comes after this title
         matched = None
-        for sp_start, sp_end in source_positions:
+        for sp in source_positions:
+            sp_start = sp[0]
+            sp_end = sp[1]
             if sp_start > tl["title_end"] and sp_start not in used_sources:
                 matched = (sp_start, sp_end)
                 used_sources.add(sp_start)
@@ -153,8 +258,15 @@ def find_incidents(text: str) -> list[dict]:
         if matched is None:
             continue
 
-        raw_title = tl["raw_title"]
-        cleaned_title = clean_title(raw_title)
+        # Most recent section header before this title's start position
+        category = ""
+        for hdr_pos, hdr_text in section_headers:
+            if hdr_pos < tl["title_start"]:
+                category = hdr_text
+            else:
+                break
+
+        cleaned_title = clean_title(tl["raw_title"])
         body = text[tl["title_end"]:matched[0]].strip()
         full = text[tl["title_start"]:matched[1]].strip()
 
@@ -162,28 +274,19 @@ def find_incidents(text: str) -> list[dict]:
             "title": cleaned_title,
             "body": body,
             "date": tl["date"],
+            "category": category,
             "full_text": full,
         })
 
-    # -- Step 4: Filter out non-incident matches ------------------------------
-    # Real incidents have titles with keywords about crimes/legal outcomes
-    # and their titles are a reasonable length (not entire document preambles).
-    title_keywords = re.compile(
-        r"(?:embezzl|fraud|stol|steal|sentenced|guilty|charged|theft|"
-        r"kickback|scheme|conspir|misappropriat|indicted|arrested|"
-        r"pleads?|convicted|stealing|pocketing|accused|admits?|"
-        r"fired|spent|murder|robbery|negligent|awarded)",
-        re.IGNORECASE,
-    )
-
+    # -- Step 4: Filter out non-incident matches -----------------------------
     filtered = []
     for inc in incidents:
         title = inc["title"]
-        # Skip if the title itself is too long (likely captured preamble)
+        # Skip titles that are too long (likely captured document preamble)
         if len(title) > 300:
             continue
-        # Skip if the title doesn't contain crime/legal keywords
-        if not title_keywords.search(title):
+        # Skip titles without crime/legal keywords
+        if not TITLE_KEYWORDS.search(title):
             continue
         filtered.append(inc)
 
@@ -209,6 +312,7 @@ def write_incident_markdown(incident: dict, output_dir: str, index: int) -> str:
     title = incident["title"]
     body = incident["body"]
     date = incident["date"]
+    category = incident.get("category", "")
 
     slug = sanitize_filename(title)
     filename = f"{index:03d}_{slug}.md"
@@ -217,6 +321,8 @@ def write_incident_markdown(incident: dict, output_dir: str, index: int) -> str:
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
         f.write(f"**Date:** {date}\n\n")
+        if category:
+            f.write(f"**Category:** {category}\n\n")
         f.write("---\n\n")
 
         # Normalize body into clean paragraphs
@@ -235,13 +341,14 @@ def write_index(incidents: list[dict], output_dir: str) -> str:
     with open(index_path, "w", encoding="utf-8") as f:
         f.write("# Insider Threat Incidents – Extracted Index\n\n")
         f.write(f"**Total incidents extracted:** {len(incidents)}\n\n")
-        f.write("| # | Date | Title |\n")
-        f.write("|---|------|-------|\n")
+        f.write("| # | Date | Category | Title |\n")
+        f.write("|---|------|----------|-------|\n")
         for i, inc in enumerate(incidents, start=1):
             slug = sanitize_filename(inc["title"])
             fname = f"{i:03d}_{slug}.md"
             short_title = inc["title"][:120]
-            f.write(f"| {i} | {inc['date']} | [{short_title}]({fname}) |\n")
+            cat = inc.get("category", "")
+            f.write(f"| {i} | {inc['date']} | {cat} | [{short_title}]({fname}) |\n")
     return index_path
 
 
@@ -271,11 +378,12 @@ def main():
         return
 
     for i, inc in enumerate(incidents, start=1):
-        fp = write_incident_markdown(inc, output_dir, i)
         short = inc["title"][:95]
         print(f"  [{i:3d}] {short}")
 
     index_path = write_index(incidents, output_dir)
+    for i, inc in enumerate(incidents, start=1):
+        write_incident_markdown(inc, output_dir, i)
 
     print(f"\n{'='*70}")
     print(f"Done! {len(incidents)} incidents extracted.")
